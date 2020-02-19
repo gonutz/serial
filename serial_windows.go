@@ -11,13 +11,16 @@ import (
 	"unsafe"
 )
 
+const MAXDWORD = 0xFFFFFFFF
+
 type Port struct {
-	f  *os.File
-	fd syscall.Handle
-	rl sync.Mutex
-	wl sync.Mutex
-	ro *syscall.Overlapped
-	wo *syscall.Overlapped
+	f              *os.File
+	fd             syscall.Handle
+	rl             sync.Mutex
+	wl             sync.Mutex
+	ro             *syscall.Overlapped
+	wo             *syscall.Overlapped
+	writeTimeoutMs uint32
 }
 
 type structDCB struct {
@@ -37,7 +40,7 @@ type structTimeouts struct {
 	WriteTotalTimeoutConstant   uint32
 }
 
-func openPort(name string, baud int, databits byte, parity Parity, stopbits StopBits, readTimeout time.Duration) (p *Port, err error) {
+func openPort(name string, baud int, databits byte, parity Parity, stopbits StopBits, readTimeout, writeTimeout time.Duration) (p *Port, err error) {
 	if len(name) > 0 && name[0] != '\\' {
 		name = "\\\\.\\" + name
 	}
@@ -85,6 +88,16 @@ func openPort(name string, baud int, databits byte, parity Parity, stopbits Stop
 	port.fd = h
 	port.ro = ro
 	port.wo = wo
+	port.writeTimeoutMs = MAXDWORD
+	if writeTimeout > 0 {
+		ms := writeTimeout.Nanoseconds() / 1e6
+		if ms < 1 {
+			ms = 1
+		} else if ms > MAXDWORD-1 {
+			ms = MAXDWORD - 1
+		}
+		port.writeTimeoutMs = uint32(ms)
+	}
 
 	return port, nil
 }
@@ -105,7 +118,7 @@ func (p *Port) Write(buf []byte) (int, error) {
 	if err != nil && err != syscall.ERROR_IO_PENDING {
 		return int(n), err
 	}
-	return getOverlappedResult(p.fd, p.wo)
+	return getOverlappedResultEx(p.fd, p.wo, p.writeTimeoutMs)
 }
 
 func (p *Port) Read(buf []byte) (int, error) {
@@ -124,7 +137,7 @@ func (p *Port) Read(buf []byte) (int, error) {
 	if err != nil && err != syscall.ERROR_IO_PENDING {
 		return int(done), err
 	}
-	return getOverlappedResult(p.fd, p.ro)
+	return getOverlappedResultEx(p.fd, p.ro, MAXDWORD)
 }
 
 // Discards data written to the port but not transmitted,
@@ -138,7 +151,7 @@ var (
 	nSetCommTimeouts,
 	nSetCommMask,
 	nSetupComm,
-	nGetOverlappedResult,
+	nGetOverlappedResultEx,
 	nCreateEvent,
 	nResetEvent,
 	nPurgeComm,
@@ -156,7 +169,7 @@ func init() {
 	nSetCommTimeouts = getProcAddr(k32, "SetCommTimeouts")
 	nSetCommMask = getProcAddr(k32, "SetCommMask")
 	nSetupComm = getProcAddr(k32, "SetupComm")
-	nGetOverlappedResult = getProcAddr(k32, "GetOverlappedResult")
+	nGetOverlappedResultEx = getProcAddr(k32, "GetOverlappedResultEx")
 	nCreateEvent = getProcAddr(k32, "CreateEventW")
 	nResetEvent = getProcAddr(k32, "ResetEvent")
 	nPurgeComm = getProcAddr(k32, "PurgeComm")
@@ -217,18 +230,16 @@ func setCommState(h syscall.Handle, baud int, databits byte, parity Parity, stop
 
 func setCommTimeouts(h syscall.Handle, readTimeout time.Duration) error {
 	var timeouts structTimeouts
-	const MAXDWORD = 1<<32 - 1
 
 	// blocking read by default
-	var timeoutMs int64 = MAXDWORD - 1
-
+	var readTimeoutMs int64 = MAXDWORD - 1
 	if readTimeout > 0 {
 		// non-blocking read
-		timeoutMs = readTimeout.Nanoseconds() / 1e6
-		if timeoutMs < 1 {
-			timeoutMs = 1
-		} else if timeoutMs > MAXDWORD-1 {
-			timeoutMs = MAXDWORD - 1
+		readTimeoutMs = readTimeout.Nanoseconds() / 1e6
+		if readTimeoutMs < 1 {
+			readTimeoutMs = 1
+		} else if readTimeoutMs > MAXDWORD-1 {
+			readTimeoutMs = MAXDWORD - 1
 		}
 	}
 
@@ -256,7 +267,7 @@ func setCommTimeouts(h syscall.Handle, readTimeout time.Duration) error {
 
 	timeouts.ReadIntervalTimeout = MAXDWORD
 	timeouts.ReadTotalTimeoutMultiplier = MAXDWORD
-	timeouts.ReadTotalTimeoutConstant = uint32(timeoutMs)
+	timeouts.ReadTotalTimeoutConstant = uint32(readTimeoutMs)
 
 	r, _, err := syscall.Syscall(nSetCommTimeouts, 2, uintptr(h), uintptr(unsafe.Pointer(&timeouts)), 0)
 	if r == 0 {
@@ -313,12 +324,16 @@ func newOverlapped() (*syscall.Overlapped, error) {
 	return &overlapped, nil
 }
 
-func getOverlappedResult(h syscall.Handle, overlapped *syscall.Overlapped) (int, error) {
+func getOverlappedResultEx(h syscall.Handle, overlapped *syscall.Overlapped, timeoutMs uint32) (int, error) {
+	println(timeoutMs)
 	var n int
-	r, _, err := syscall.Syscall6(nGetOverlappedResult, 4,
+	r, _, err := syscall.Syscall6(nGetOverlappedResultEx, 5,
 		uintptr(h),
 		uintptr(unsafe.Pointer(overlapped)),
-		uintptr(unsafe.Pointer(&n)), 1, 0, 0)
+		uintptr(unsafe.Pointer(&n)),
+		uintptr(timeoutMs),
+		0, // alertable
+		0)
 	if r == 0 {
 		return n, err
 	}
